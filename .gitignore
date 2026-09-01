@@ -2,3 +2,6 @@ node_modules/
 .idea/
 .DS_Store
 *.log
+
+# Exercise prompt — kept local, not published with the public submission repo
+Platform Homework: Legacy File Conversion.txt
