@@ -59,6 +59,8 @@ export interface WorkerConfig {
   timeoutMs: number;
   maxAttempts: number;
   workerId: string;
+  /** What the converter produces: `result.json` for imports, `package.zip` for exports. */
+  resultFilename: string;
 }
 
 /**
@@ -69,8 +71,12 @@ export interface WorkerConfig {
 const PERMANENT_EXIT_CODES = new Set([2]);
 
 /** Each attempt writes to its own key, so no attempt can overwrite another's output. */
-export function attemptOutputKey(jobId: string, attempt: number): string {
-  return `jobs/${jobId}/attempts/${attempt}/result.json`;
+export function attemptOutputKey(
+  jobId: string,
+  attempt: number,
+  resultFilename: string,
+): string {
+  return `jobs/${jobId}/attempts/${attempt}/${resultFilename}`;
 }
 
 export async function handle(
@@ -111,7 +117,7 @@ export async function handle(
     return;
   }
 
-  const outputKey = attemptOutputKey(job.id, attempt);
+  const outputKey = attemptOutputKey(job.id, attempt, config.resultFilename);
   const conversion = converter.start(job.inputKey, outputKey);
 
   let exitCode: number;

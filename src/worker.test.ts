@@ -124,7 +124,13 @@ function makeMessage(jobId: string, receiveCount = 1) {
 }
 
 function config(over: Partial<WorkerConfig> = {}): WorkerConfig {
-  return { timeoutMs: 900_000, maxAttempts: 3, workerId: "worker-1", ...over };
+  return {
+    timeoutMs: 900_000,
+    maxAttempts: 3,
+    workerId: "worker-1",
+    resultFilename: "result.json",
+    ...over,
+  };
 }
 
 const queuedJob: Job = {
@@ -212,6 +218,19 @@ test("each attempt converts into its own output key", async () => {
 
   assert.equal(converter.starts[0]?.outputKey, "jobs/job-1/attempts/1/result.json");
   assert.equal(converter.starts[1]?.outputKey, "jobs/job-1/attempts/2/result.json");
+});
+
+test("the result filename comes from the lane's config", async () => {
+  // The export lane produces a zip, not JSON. One codebase, two task definitions.
+  const store = new InMemoryJobStore(queuedJob);
+  const converter = new FakeConverter(() => 0);
+  const clock = new ManualClock();
+
+  const { message } = makeMessage("job-1", 1);
+  await handle(message, store, converter, clock, config({ resultFilename: "package.zip" }));
+
+  assert.equal(converter.starts[0]?.outputKey, "jobs/job-1/attempts/1/package.zip");
+  assert.equal(store.snapshot("job-1").outputKey, "jobs/job-1/attempts/1/package.zip");
 });
 
 test("a timed-out conversion is killed and reaped", async () => {

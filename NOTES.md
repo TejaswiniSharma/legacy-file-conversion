@@ -132,8 +132,9 @@ Three fixes, each the code version of a decision in DESIGN.md §4.
 - **`Job` gains `owner`.** Correctness comes from `attempt` acting as the fencing token. `owner` is there
   for legibility and debugging.
 - **`handle()` gains a `WorkerConfig`.** Replaces the hardcoded 30 second timeout, which would have killed
-  every real job of either kind, and the hardcoded retry limit. This is also what lets one codebase serve
-  both lanes.
+  every real job of either kind, and the hardcoded retry limit. It also carries the result filename, so
+  imports write `result.json` and exports write `package.zip` from the same code. This is what lets one
+  codebase serve both lanes.
 - **No `leaseExpiresAt`, even though DESIGN.md §4 says "unowned or lease expired".** In this handler the
   SQS visibility timeout is the lease. It sits above the job timeout, so a redelivered message already
   means the previous attempt overran. A worker reading `(running, N)` and swapping to `(running, N+1)` is
@@ -142,10 +143,11 @@ Three fixes, each the code version of a decision in DESIGN.md §4.
 
 ### Verification
 
-Seven tests, run with `npm test`. Five were confirmed to fail against the original logic by temporarily
+Eight tests, run with `npm test`. Five were confirmed to fail against the original logic by temporarily
 restoring it behind the new interfaces and running the suite again: duplicate conversions, stale
-overwrite, shared output keys, missing kill, and exit 2 retries all reproduce. The two that pass either
-way, transient retry and terminal-state ack, guard behaviour the original already had right.
+overwrite, shared output keys, missing kill, and exit 2 retries all reproduce. Of the three that pass
+either way, two guard behaviour the original already had right (transient retry, terminal-state ack) and
+one covers the per-lane result filename, which the original had no concept of.
 
 ### Not fixed in the worker, and why
 
