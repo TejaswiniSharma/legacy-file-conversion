@@ -52,6 +52,58 @@ Lever 1 applies regardless and composes with lever 2: whatever retention is agre
 once shortly after creation and then sit untouched, which is precisely the access pattern Glacier Instant
 Retrieval is priced for.
 
+## Lifecycle details (the reasoning behind the DESIGN.md §4 diagrams)
+
+**The principle underneath all of it.** Duplicate work cannot be prevented; duplicate publication can. An
+orphaned conversion outlives the worker that started it, on a machine that may no longer exist, where no
+signal can reach it. So rather than fight that, the system lets it run and guarantees it can never
+publish. Duplicate work is wasteful. Duplicate publishing is what corrupts data, and only that has to be
+impossible.
+
+**Where ownership sits**
+
+| Boundary | Owner |
+|---|---|
+| Job state | DynamoDB — the only source of truth |
+| Work distribution and retries | SQS — never the state of record |
+| Result bytes | S3, one file per attempt, never overwritten |
+| Deciding which attempt counts | The single conditional update |
+
+Exactly one write in the system needs fencing: the conditional update that sets `outputKey` and
+`succeeded` only if the writer still owns the job. S3 needs no protection at all, because no two attempts
+ever share a filename. The safe ordering falls out for free — the attempt file exists before the status
+changes, so the only possible window is "result ready, job still says running". The dangerous direction,
+"job says succeeded but the file is missing", cannot happen.
+
+**Retry boundary.** Retries come from SQS redelivery, not from application bookkeeping: a worker that
+cannot finish simply does not delete the message. Job timeouts are set below the redelivery window — a
+~15 minute ceiling against a ~20 minute visibility timeout on imports, ~90 against ~100 on exports — so a
+retry never starts while an attempt is legitimately still running. The gap covers killing and reaping the
+subprocess and writing the final status. Messages that run out of attempts land in the lane's DLQ.
+
+**Failure classification.** Exit 2 (invalid database) is permanent, so the job fails immediately with the
+reason recorded and no retries spent — the answer will not change. Exit 137 (SIGKILL, usually OOM) is
+transient and gets retried. Treating them the same way would either waste three attempts on a file that
+can never convert, or permanently fail a job that would have worked on the next run.
+
+**No heartbeat on the import lane.** A heartbeat is code that runs periodically, and a conversion that
+blocks the Node thread never lets it run — the timer sits queued and only fires once the job has already
+finished. So on imports the lease alone handles recovery: it is set to the longest a job could take, and a
+dead worker's job becomes claimable when it expires. This works whether or not the library yields to the
+event loop, which is what makes it the safer choice; a heartbeat that silently never fires would be worse
+than none at all. Fast detection buys little anyway, since a dead worker stalls only its own job rather
+than the fleet, and under A1 nobody is waiting.
+
+**Killing is not enough — the subprocess must be reaped.** A timed-out JVM keeps running unless its owner
+terminates it and confirms it is gone. It holds memory and scratch disk, and at one job per task it idles
+the whole task until the handler returns. It can also still finish and write its package, which is
+precisely why publication is fenced rather than trusted: the design tolerates the orphan instead of
+depending on killing it successfully.
+
+**Orphans cost more on the export lane.** An abandoned import attempt strands at most 500 MB. An abandoned
+export attempt strands up to 40 GB, on the storage line that is already 96% of the bill. The lifecycle
+rule that deletes unreferenced attempt prefixes matters much more for exports than for imports.
+
 ## Part 2 — what changed in the worker
 
 Three fixes, all of them the code expression of decisions in DESIGN.md §4.
