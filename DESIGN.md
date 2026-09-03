@@ -168,6 +168,38 @@ drain rate for more than a day, or once a completion-latency KPI is agreed.
 
 ## 3. Smallest changes before v1
 
+Grouped by cost, because several of these are one-line changes that close large risks. Nothing here is
+new design — each item is the minimum expression of a decision in §1 and §4.
+
+**Configuration only — cheapest, and closes the most certain failure**
+
+| Change | Closes |
+|---|---|
+| Messages in flight per task: 10 → **1** | Risk 2 entirely. The 20 GB-on-4 GB oversubscription is a config value, and removing it also removes most exit-137s and the orphans they create |
+| Export task: **8 GB memory, ~200 GB ephemeral storage** | The half of Risk 1 where a 40 GB package cannot be written to a 20 GB disk |
+| Per-lane timeouts: import ~15 min, export ~90 min, with queue visibility set above each | The flat 30-second timeout, which kills every real job of either kind |
+
+**Infrastructure**
+
+| Change | Closes |
+|---|---|
+| Two queues with a DLQ each, two ECS services from two task definitions | The rest of Risk 1 — one visibility timeout cannot serve a 15-minute and a 90-minute job, and one task definition cannot serve both resource profiles |
+| Wire the three alarms from §5 | A DLQ nobody watches is a silent pile-up |
+| S3 lifecycle rule expiring unreferenced attempt prefixes | The orphan storage cost this design introduces |
+
+**Code**
+
+| Change | Closes |
+|---|---|
+| Claim jobs with a **conditional write**, replacing `get()`-then-`put()` | The duplicate-execution race — two deliveries <100 ms apart can no longer both start work |
+| **Attempt-scoped result keys**, plus one fenced publish that sets `outputKey` and `succeeded` only if still owner | Risk 3. Silent corruption becomes structurally impossible rather than unlikely |
+| **Kill and reap** the subprocess on timeout | Orphans holding memory and disk, and idling a whole task at one job per task |
+| Classify exits: **2 fails immediately, 137 retries** | Three wasted attempts on files that can never convert, and permanent failure of jobs that would have succeeded |
+
+**Deliberately not in v1**, each recorded with its trigger in NOTES.md: caller-supplied idempotency keys
+(duplicate *submission* wastes money but cannot corrupt), moving the import conversion to a
+`worker_thread`, ECS task scale-in protection, and load shedding.
+
 ## 4. Job lifecycle
 
 <!-- One import and one export end to end: state ownership, retry boundaries,
@@ -330,26 +362,170 @@ ever share a filename. The ordering also falls out safely — the attempt file e
 changes, so the only possible window is "result ready, job still says running." The dangerous direction,
 "job says succeeded but the file is missing," cannot occur.
 
-<!-- OPEN, to resolve before this section is final:
-     - Import heartbeat: the lease expires, but an import worker cannot refresh it because the
-       conversion blocks the Node event loop. Either move the conversion to a worker_thread, or
-       rely on the timeout alone.
+**No heartbeat on this lane.** A heartbeat is code that runs periodically, and a conversion that blocks
+the Node thread never lets it run — the timer is queued and fires only once the job is already finished.
+So the lease alone carries recovery here: it is set to the maximum a job could take, and a dead worker's
+job is reclaimable when it expires. This holds whether or not the library yields to the event loop, which
+is why it is the safer choice — a heartbeat that silently never fires would be worse than none. Fast
+detection buys little in any case: a dead worker stalls only its own job, not the fleet, and under A1
+nobody is waiting on a deadline.
+
+<!-- OPEN, to resolve before §4 is final:
      - Is `failed` terminal? Exit 2 and exhausted retries both land there; whether either can
        return to `queued` is undecided.
-     - Concrete lease duration and heartbeat interval.
+     - Concrete lease durations per lane.
      - Webhooks: the brief mentions an optional completion webhook; not yet discussed. -->
 
 ### Export
+
+Submission is identical in shape — Lambda writes the job record, then enqueues to `export-queue`. The
+inputs differ: an export reads JSON plus a media map, so it pulls many objects rather than one database
+file, and it produces a zip of 10–40 GB rather than ≤500 MB of JSON.
+
+**The state machine is the same one.** Ownership, the conditional claim, attempt-scoped keys and the
+single fenced write are unchanged — that is the point of sharing a codebase. What differs is how the
+converter is invoked, and what the worker can do while it runs.
+
+**Worker processing**
+
+```
+        receive from export-queue
+        (batch up to 10, process ONE)
+                    │
+                    ▼
+     ┌──────────────────────────────────┐
+     │  CONDITIONAL CLAIM  (DynamoDB)   │
+     │  ONLY IF unowned OR lease expired│
+     └──────────────┬───────────────────┘
+          ┌─────────┴─────────┐
+      rejected              won
+          │                   │
+          ▼                   ▼
+     ack, return   outputKey = jobs/{id}/attempts/{n}/package.zip
+                              │
+                              ▼
+                    spawn JVM subprocess ────────┐
+                              │                  │
+                              │        ┌─────────▼───────────────┐
+                              │        │ HEARTBEAT every ~30 s   │
+                              │        │ extend lease AND        │
+                              │        │ extend visibility       │
+                              │        │ (Node loop is free —    │
+                              │        │  the JVM is a subprocess)│
+                              │        └─────────────────────────┘
+                              │
+        ┌────────────┬────────┴───────┬──────────────┐
+     exit 0       exit 2          exit 137    timeout (~90 min)
+    success    invalid input    killed / OOM         │
+        │            │                │              ▼
+        │            ▼                │      SIGTERM the JVM,
+        │      mark failed            │      then confirm it is
+        │      (permanent,            │      actually dead (reap)
+        │       no retry)             │              │
+        │            │                └──────┬───────┘
+        │            ▼                       ▼
+        │           ack             do NOT delete message
+        ▼                                    │
+┌───────────────────────────────┐            ▼
+│ CONDITIONAL UPDATE (DynamoDB) │    SQS redelivers after
+│ set outputKey, status=succeeded│    visibility timeout
+│ ONLY IF I am still the owner  │            │
+└───────────────┬───────────────┘            ▼
+        ┌───────┴───────┐            receiveCount > max?
+       won           rejected              ┌─────┴─────┐
+        │          (orphan — a            yes         no
+        ▼           newer attempt          │           │
+       ack          already won)           ▼           ▼
+                        │            export-dlq   back to CLAIM
+                        ▼
+                       ack
+              (its package is left
+               unreferenced)
+```
+
+**What differs from the import lane**
+
+| | Import | Export |
+|---|---|---|
+| Converter | TypeScript library, in-process | vendor JVM subprocess |
+| Node loop while converting | **blocked** | **free** |
+| Heartbeat | none — lease alone | every ~30 s, extends lease and visibility |
+| Job timeout | ~15 min | ~90 min |
+| Queue visibility timeout | ~20 min | ~100 min |
+| Cleanup on timeout | nothing to kill | SIGTERM the subprocess, then reap it |
+| Result | `result.json`, ≤500 MB | `package.zip`, 10–40 GB |
+| Task | 1 vCPU / 4 GB / 20 GB disk | 1 vCPU / 8 GB / ~200 GB disk |
+
+**Killing is not enough; the subprocess must be reaped.** A timed-out JVM keeps running unless its owner
+terminates it and confirms it is gone. Two consequences specific to this lane. It continues to hold
+memory and scratch disk — and at one job per task, the task cannot accept anything else until the handler
+returns, so an unreaped process idles a whole task. And it can still finish and write its package, which
+is exactly why publication is fenced rather than trusted: the design tolerates the orphan instead of
+depending on killing it successfully.
+
+**Orphans are more expensive here.** An abandoned import attempt strands at most 500 MB. An abandoned
+export attempt strands up to 40 GB, on the storage line that is already 96% of the bill (§6). The
+lifecycle rule deleting unreferenced attempt prefixes matters more for this lane than for imports.
+
+**Retry boundary and failure classification** are unchanged in principle — SQS redelivery drives retries,
+exit 2 fails immediately without spending attempts, exit 137 is retried, exhausted messages land in
+`export-dlq`. The numbers differ only because the job ceiling does.
+
+**One unresolved operational cost.** ECS allows at most 120 seconds between SIGTERM and SIGKILL, and an
+export runs tens of minutes, so no deployment or scale-in event can drain this lane gracefully. The
+design survives it — a killed attempt becomes an orphan, and orphans cannot publish — but every release
+still discards in-flight work. Recorded as a remaining risk rather than solved here.
 
 ## 5. Operations, deployment, and observability
 
 ### Three operational signals
 
-<!-- Each: the metric, where it is emitted, a rough threshold, the action it should cause. -->
+Two filters decided this set. An alert must have an **action** — if nobody does anything differently when
+it fires, it belongs on the dashboard. And it must be **low-noise**, because an alarm that cries wolf gets
+muted, which is worse than not having it.
+
+| Signal | Metric and source | Threshold | Action |
+|---|---|---|---|
+| **Queue not draining** | `ApproximateAgeOfOldestMessage`, per queue. CloudWatch, SQS built-in — no instrumentation | Import > 1 hr; **Export > 8 hrs** | Check whether the service is already at max desired count. If yes, raise the ceiling. If no, autoscaling is not reacting — check the scaling policy and for task launch failures. |
+| **Jobs exhausted retries** | `ApproximateNumberOfMessagesVisible` on each DLQ. CloudWatch, SQS built-in | ≥ 1 message, sustained 5 min | Inspect the message, read the job's recorded error, classify as bug or bad input. The DLQ is the human-investigation queue; a growing one is the system asking for help. |
+| **Job failure rate** | Custom metric emitted by the worker on every terminal state, dimensioned by lane and error class | > 5% over a rolling 15 min | Depends which class moved. Permanent failures up → look upstream at what is producing bad files. Transient up → look at the fleet: memory, task kills. Either spiking within ~30 min of a deploy → roll back. |
+
+Two notes on the choices. **Age, not depth** — depth is *expected* to hit 3,000 during onboarding, so it
+makes a bad alarm; age growing means work is not draining at all. And the **export threshold of 8 hours is
+derived from assumption A2**: if the oldest export is older than that, the onboarding burst will not clear
+by morning and the assumption the fleet was sized against is breaking. It is not a number picked to look
+reasonable.
+
+The failure-rate signal is deliberately the broadest of the three, because it does double duty — it is
+also how a bad release is detected, below.
+
+### Watched on a dashboard, not alerted
+
+Useful to see, but no immediate action when they move:
+
+- **Publish rejections** — orphaned attempts that finished late and lost the fence. Should be zero;
+  sustained non-zero means duplicate execution is happening and lease timing is wrong.
+- **Exit 137 count** — should be near zero once concurrency is 1. Noisy as an alarm because deploys
+  produce these too, via the stop timeout.
+- **Running tasks vs. max desired count**, per service — how much scaling headroom is left.
+- **Unreferenced attempt-prefix storage** — the orphan cost this design introduces (§4).
+- **Job duration p50/p95 per lane** — the input that settles the open measurements and the export vCPU
+  question.
 
 ### How a change reaches production
 
-<!-- One paragraph, no more: pipeline stages, detecting a bad release, stopping/reversing it. -->
+A change reaches production through GitHub Actions: unit and integration tests run on every pull request,
+exercising the job store, queue and converter seams against in-memory implementations; on merge, the
+workflow builds one container image tagged with the commit SHA, pushes it to ECR, and registers new
+revisions of both task definitions pointing at it. Deployment is staggered — `import-svc` is updated first
+and watched before `export-svc` — because imports finish in minutes and surface a bad build quickly, while
+an export takes tens of minutes to produce its first data point. A bad release shows up as the failure-rate
+signal crossing 5% within that window, correlated with the new task definition revision, with the DLQ
+alarm as slower confirmation. Reversing it means pointing the service back at the previous revision: ECS
+drains and replaces tasks, and because job state lives in DynamoDB and results in S3, a rollback is a
+compute swap rather than a migration. The one thing rollback cannot undo is work already killed in flight
+— exports in progress are lost to the 120-second stop timeout either way, and are recovered by SQS
+redelivery rather than by the deployment system.
 
 ## 6. Sizing and cost
 
