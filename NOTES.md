@@ -52,6 +52,47 @@ Lever 1 applies regardless and composes with lever 2: whatever retention is agre
 once shortly after creation and then sit untouched, which is precisely the access pattern Glacier Instant
 Retrieval is priced for.
 
+## Design detail (behind DESIGN.md §1 and §2)
+
+### Considered and rejected: packing several jobs onto one task
+
+Running ~8 jobs on one large task is roughly 10% cheaper per unit of work, because the per-task overhead
+is paid once instead of eight times. Rejected for three reasons.
+
+Fargate sells 1, 2, 4, 8 or 16 vCPU. Aiming for exactly 10 concurrent jobs forces the 16 vCPU tier and
+its 32 GB memory floor, which lands about **35% worse** than simply scaling out — you pay for six idle
+cores and 11 GB nobody uses.
+
+An OOM kills the whole task, so packing multiplies the blast radius by the packing factor. One bad job
+becomes eight orphaned conversions and eight redeliveries, which is exactly the condition the fence in §4
+exists to survive.
+
+And for imports it does not work at all. The converter is in-process and Node runs JavaScript on one
+thread, so eight concurrent calls would serialise while eight cores sat idle — full cost, no benefit.
+Making it real would mean moving conversions into worker threads, which is a change to the thing we were
+told not to reimplement.
+
+Saving 10% of the compute line — itself a small part of the bill next to S3 — is not worth a tenfold
+blast radius.
+
+### Why the risks rank the way they do
+
+Ranked by immediacy rather than severity alone, which is worth stating because the two orderings differ.
+
+Risks 1 and 2 are arithmetic. A 40 GB package cannot be written to a 20 GB disk, and 20 GB of demand
+cannot run in 4 GB of memory. Both fail on day one, every time, before any logic is reached — and both
+are loud, so the first test run catches them.
+
+Risk 3 needs a race to fire, so it is less certain. But it is silent, which is what makes it the one that
+hurts most: nothing in the proposal would notice, and detection is a customer opening a bad package weeks
+later. Ranked third on immediacy, first on severity.
+
+The three also interact, which is why the order is not arbitrary. Risk 2 is the *engine* for Risk 3: each
+OOM kill leaves an unreaped subprocess and triggers a redelivery, which is precisely how two attempts end
+up alive at once. And a blocked Node event loop cannot extend a visibility timeout, so healthy in-flight
+work gets redelivered too. Fixing the sizing removes most of the conditions that make the corruption
+possible — but not the corruption itself, which is why both are fixed rather than just the cheap one.
+
 ## Lifecycle details (the reasoning behind the DESIGN.md §4 diagrams)
 
 **The principle underneath all of it.** Duplicate work cannot be prevented; duplicate publication can. An

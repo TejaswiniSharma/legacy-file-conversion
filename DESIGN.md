@@ -83,14 +83,8 @@ jobs means ten tasks from one definition, not ten definitions.
 | Running tasks | **0 to ~70**, set by queue-depth autoscaling |
 | Jobs per task | **1** |
 
-*Considered and rejected:* packing ~8 jobs onto one big task is about 10% cheaper per unit of work, since
-the per-task overhead is paid once instead of eight times. Turned down for three reasons. Fargate sells 1,
-2, 4, 8 or 16 vCPU, so aiming for exactly 10 forces the 16 vCPU tier and its 32 GB floor — about 35%
-*worse* than scaling out. An OOM kills the whole task, so packing multiplies the blast radius and turns
-one bad job into eight orphaned conversions. And for imports it does not work at all, because the
-converter is in-process and Node runs JavaScript on one thread, so eight concurrent calls would serialise
-while eight cores sat idle. Saving 10% of the compute line — itself a small part of the bill next to S3 —
-is not worth a tenfold blast radius.
+Packing several jobs onto one larger task was considered and rejected — it saves about 10% of the compute
+line for a tenfold blast radius, and does not work for imports at all. The arithmetic is in NOTES.md.
 
 ## 2. Risk ranking
 
@@ -105,9 +99,9 @@ finish but strands a crashed import for 90 minutes. Fifteen minutes recovers imp
 redelivers a still-running export, putting two workers on one job. Separately, Fargate's default 20 GB
 disk cannot hold a 10–40 GB package no matter how it is tuned.
 
-**Impact.** Large exports fail on disk before the conversion logic is ever reached — a total failure for
-the biggest packages. At the same time imports, which are 80% of daily volume, queue behind
-tens-of-minutes exports. Onboarding evenings mix both, so this is worst exactly when volume peaks.
+**Impact.** Large exports fail on disk before the conversion logic is ever reached, and imports — 80% of
+daily volume — queue behind tens-of-minutes exports. Onboarding evenings mix both, so it is worst exactly
+when volume peaks.
 
 ### Risk 2 — Worker concurrency exceeds task memory by about 5×
 
@@ -118,10 +112,9 @@ For imports it is worse than the arithmetic suggests. The converter is an in-pro
 and Node runs JavaScript on one thread, so ten "concurrent" conversions actually serialise while all ten
 hold their memory. You pay the full cost of concurrency and get none of the benefit.
 
-**Impact.** Guaranteed OOM kills under real load, which is where the observed exit 137 comes from. Two
-knock-on effects matter more than the failures themselves. A blocked event loop cannot extend visibility
-timeouts, so healthy work gets redelivered and duplicated. And every OOM leaves an unreaped subprocess
-behind. Both feed Risk 3.
+**Impact.** Guaranteed OOM kills under real load — the source of the observed exit 137. The knock-on
+effects matter more than the failures themselves: healthy work gets redelivered and duplicated, and every
+kill leaves an unreaped subprocess behind. Both feed Risk 3.
 
 ### Risk 3 — A job can report `succeeded` while publishing the wrong bytes
 
@@ -135,11 +128,9 @@ write there. With at-least-once delivery, the failure runs like this:
 The worker reads the job and then writes it, which is check-then-act, so two deliveries arriving under
 100 ms apart can both pass the terminal-state check and both start converting.
 
-**Impact.** The customer gets an inspection package built from a superseded conversion, and the job says
-it succeeded. No alarm fires, because as far as the queue is concerned everything finished. These are
-municipal CCTV records kept as compliance history, so output that is wrong but confident is much worse
-than output that failed: a failed job gets retried, a wrong one gets archived and trusted. It would
-probably be found by a customer opening a bad package weeks later.
+**Impact.** The customer gets an inspection package built from a superseded conversion while the job
+reports success, and no alarm fires. These are municipal compliance records: a failed job gets retried, a
+wrong one gets archived and trusted, and it surfaces weeks later when someone opens a bad package.
 
 ### Deliberately left alone
 
