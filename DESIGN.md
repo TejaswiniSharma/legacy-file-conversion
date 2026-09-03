@@ -47,13 +47,10 @@ job lifecycle, not the converter.
 Share a queue and a task definition, and every row above has to collapse into a single number. That is
 the argument for splitting, and it is easier to see as a table than to explain.
 
-### Three choices worth defending
+### Three decisions
 
-**Two queues, not one.** A queue has exactly one visibility timeout. Set it to 90 minutes so exports can
-finish, and a crashed import sits invisible for 90 minutes before anyone retries it. Set it to 15 minutes
-so imports recover quickly, and a 40-minute export gets redelivered while it is still running, putting two
-workers on the same job. There is no value that works for both. Fargate's 20 GB default disk, against
-10–40 GB packages, points the same way.
+**Two queues, not one.** Neither the visibility timeout nor the disk size has a value that serves both
+lanes, so there is nothing to compromise on. The argument is Risk 1 in §2.
 
 **One image, two task definitions.** Configuration lives in the task definition, not in the image, so the
 same bytes can run with different CPU, memory, disk, entry point, queue and IAM role. Sharing the image
@@ -62,9 +59,9 @@ result. Two copies of that is how one of them quietly goes wrong. The cost is th
 JVM they never run. Splitting into two images later needs a second build target and no application code
 change at all.
 
-**One job per task, not ten.** `ReceiveMessage` returns at most 10 messages per call, and the proposal
-turned that batch limit into a concurrency setting. At ~2 GB per conversion, that is 20 GB of demand on a
-4 GB task. Workers still receive in batches; they just process one job at a time.
+**One job per task, not ten.** The proposal's "10 messages" is SQS's batch limit rather than a sizing
+decision, and it puts ~20 GB of demand on a 4 GB task — Risk 2 in §2. Workers still receive in batches;
+they just process one job at a time.
 
 ```
 concurrency per task = min( vCPU count, floor(usable memory / per-job memory) )
@@ -160,9 +157,9 @@ design; each item is the smallest expression of a decision in §1 and §4.
 
 | Change | Closes |
 |---|---|
-| Jobs in flight per task: 10 → **1** | Risk 2 entirely. It is a config value, and removing it also removes most exit-137s and the orphans they create |
-| Export task: **8 GB memory, ~200 GB disk** | The half of Risk 1 where a 40 GB package cannot be written to a 20 GB disk |
-| Per-lane timeouts: import ~15 min, export ~90 min, with queue visibility set above each | The flat 30-second timeout, which kills every real job of either kind |
+| Jobs in flight per task: 10 → **1** | **Risk 2** entirely — and with it most exit-137s and the orphans they create |
+| Export task: **8 GB memory, ~200 GB disk** | The disk half of **Risk 1** |
+| Per-lane timeouts: import ~15 min, export ~90 min, visibility set above each | The flat 30-second timeout, which kills every real job |
 
 **Infrastructure**
 
@@ -176,10 +173,10 @@ design; each item is the smallest expression of a decision in §1 and §4.
 
 | Change | Closes |
 |---|---|
-| Claim jobs with a **conditional write** instead of read-then-write | The duplicate-execution race — two deliveries under 100 ms apart can no longer both start work |
-| **Attempt-scoped result keys**, plus one fenced publish that only succeeds if the writer still owns the job | Risk 3. Silent corruption becomes impossible rather than unlikely |
+| Claim jobs with a **conditional write** instead of read-then-write | The duplicate-execution half of **Risk 3** |
+| **Attempt-scoped result keys** plus one fenced publish, valid only if the writer still owns the job | The rest of **Risk 3** — silent corruption becomes impossible rather than unlikely |
 | **Kill and reap** the subprocess on timeout | Orphans holding memory and disk, and idling a whole task |
-| Classify exits: **2 fails immediately, 137 retries** | Three wasted attempts on files that can never convert, and permanent failure of jobs that would have succeeded |
+| Classify exits: **2 fails immediately, 137 retries** | Wasted attempts on files that can never convert |
 
 **Deliberately not in v1**, each with its trigger recorded in NOTES.md: caller-supplied idempotency keys,
 moving the import conversion to a `worker_thread`, ECS task scale-in protection, and load shedding.
