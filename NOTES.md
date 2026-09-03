@@ -80,13 +80,6 @@ Saving 10% of the compute line, itself small next to S3, is not worth a tenfold 
 
 ## Lifecycle details (behind the DESIGN.md §4 diagrams)
 
-**The principle underneath all of it.** Duplicate work cannot be prevented. Duplicate publication can. An
-orphaned conversion outlives the worker that started it, on a machine that may no longer exist, where no
-signal can reach it. So the system lets it run and guarantees it can never publish. Duplicate work is
-wasteful. Duplicate publishing is what corrupts data, and only that has to be impossible.
-
-**Where ownership sits**
-
 | Boundary | Owner |
 |---|---|
 | Job state | DynamoDB, the only source of truth |
@@ -101,24 +94,18 @@ wasteful. Duplicate publishing is what corrupts data, and only that has to be im
   but the file is missing", cannot happen.
 - **Retries come from SQS redelivery,** not from application bookkeeping. A worker that cannot finish
   simply does not delete the message. Job timeouts sit below the redelivery window (15 minutes against 20
-  on imports, 90 against 100 on exports), so a retry never starts while an attempt is legitimately still
+  on imports, 90 against 100 on exports), so a retry never starts while an attempt is still legitimately
   running. The gap covers killing the subprocess and writing the final status.
 - **Exit 2 is permanent, exit 137 is transient.** An invalid database will not convert on the fourth
-  attempt any more than the first, so the job fails straight away with the reason recorded. Treating both
-  the same way either wastes three attempts or permanently fails a job that would have worked.
-- **Imports get no heartbeat.** A heartbeat is code that runs periodically, and a conversion that blocks
-  the Node thread never lets it run. The timer just sits queued until the job has already finished. So the
-  lease alone handles recovery on imports, set to the longest a job could take. This works whether or not
-  the library yields to the event loop, which makes it the safer choice. A heartbeat that silently never
-  fires would be worse than none. Fast detection buys little anyway: a dead worker stalls its own job, not
-  the fleet, and under A1 nobody is waiting.
-- **Killing is not enough, the subprocess must be reaped.** A timed-out JVM keeps running unless its owner
-  terminates it and confirms it is gone. It holds memory and disk, and at one job per task it idles the
-  whole task. It can also still finish and write its package, which is why publication is fenced rather
-  than trusted.
-- **Orphans cost more on exports.** An abandoned import attempt strands at most 500 MB. An abandoned
-  export attempt strands up to 40 GB, on the line that is already 96% of the bill. The lifecycle rule that
-  clears unreferenced attempt prefixes matters much more here.
+  attempt any more than the first, so the job fails straight away. Treating both the same way either
+  wastes three attempts or permanently fails a job that would have worked.
+- **Imports get no heartbeat.** A conversion that blocks the Node thread never lets the timer run, so a
+  heartbeat there would silently never fire, which is worse than not having one. The lease alone handles
+  recovery, set to the longest a job could take. Fast detection buys little anyway: a dead worker stalls
+  its own job, not the fleet.
+- **Killing is not enough, the subprocess must be reaped.** A timed-out JVM keeps running until its owner
+  confirms it is gone. It holds memory and disk, idles the whole task at one job per task, and can still
+  finish and write its package. That last part is why publication is fenced rather than trusted.
 
 ## Part 2: what changed in the worker
 
@@ -174,7 +161,24 @@ way, transient retry and terminal-state ack, guard behaviour the original alread
 
 ## Where I stopped
 
-Part 1 is complete. Part 2 has the three fixes above with tests. Still open:
+DESIGN.md covers the six sections the brief asks for, and Part 2 has three fixes with tests. But several
+things are named rather than designed.
+
+**Named, not designed**
+
+- **Latency.** A1 assumes no target exists. Agreeing a real KPI would change fleet sizing, the scaling
+  policy, and possibly whether imports need a priority lane. This is the first conversation I would want.
+- **The DynamoDB data model.** The design calls it the source of truth without saying how it is keyed or
+  queried. No partition key, no indexes for listing jobs by status or customer, no capacity mode, no TTL
+  attribute. The conditional writes assume a single-item update, which is the easy case.
+- **The autoscaling policy.** "Scale on queue depth" is a direction, not a specification. No target value,
+  no cooldowns, no maximum task count, and no answer for what happens when the ceiling is reached.
+- **Backpressure mechanics.** §2 explains why load shedding is deliberately absent, but nothing exists if
+  that decision reverses.
+- **DLQ operations.** There is an alert on depth, but no redrive process for getting fixed jobs back into
+  the queue, and no owner for triaging them.
+
+**Open decisions and measurements**
 
 - **DESIGN.md §4 open items:** whether `failed` is terminal (and whether exit 2 and exhausted retries
   should share that state), concrete lease durations per lane, and webhook handling.
@@ -184,7 +188,8 @@ Part 1 is complete. Part 2 has the three fixes above with tests. Still open:
 - **Worker metrics.** See Remaining risks.
 
 With more time, in order: confirm A4 with a product owner, since it is worth about 92% of the monthly
-bill; run M1 to M5; then emit the metrics §5 depends on.
+bill; agree a latency KPI, since most of the undesigned items above depend on it; run M1 to M5; then emit
+the metrics §5 depends on.
 
 ## How I used AI
 

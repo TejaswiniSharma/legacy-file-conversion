@@ -183,8 +183,12 @@ moving the import conversion to a `worker_thread`, ECS task scale-in protection,
 
 ## 4. Job lifecycle
 
-Both lanes run the same state machine. Only the converter and the timings differ. The reasoning behind
-these diagrams is in NOTES.md.
+Both lanes run the same state machine. Only the converter and the timings differ.
+
+The shape comes from one idea: duplicate work cannot be prevented, but duplicate publication can. An
+orphaned conversion outlives the worker that started it, on a machine that may no longer exist, so the
+system lets it run and guarantees it can never publish. Everything below follows from that. The rest of
+the reasoning is in NOTES.md.
 
 ### Import — submission
 
