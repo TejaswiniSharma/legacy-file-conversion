@@ -77,7 +77,7 @@ jobs means ten tasks from one definition, not ten definitions.
 | | Count |
 |---|---|
 | Task definitions | **2** — `import-worker`, `export-worker`. Fixed. |
-| Running tasks | **0 to ~70**, set by queue-depth autoscaling |
+| Running tasks | **0 to ~53** at the onboarding peak (§6), set by queue-depth autoscaling |
 | Jobs per task | **1** |
 
 Packing several jobs onto one larger task was considered and rejected — it saves about 10% of the compute
