@@ -1,0 +1,5 @@
+node_modules/
+.git/
+OBSERVATIONS.md
+scripts/
+.DS_Store

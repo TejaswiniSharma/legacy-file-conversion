@@ -5,3 +5,6 @@ node_modules/
 
 # Exercise prompt — kept local, not published with the public submission repo
 Platform Homework: Legacy File Conversion.txt
+
+# The AWS spike has its own dependencies
+aws-spike/node_modules/

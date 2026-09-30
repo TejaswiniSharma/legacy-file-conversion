@@ -1,0 +1,27 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "JobStore",
+      "Effect": "Allow",
+      "Action": ["dynamodb:GetItem", "dynamodb:PutItem"],
+      "Resource": "arn:aws:dynamodb:us-east-1:${AWS_ACCOUNT_ID}:table/itpipes-jobs"
+    },
+    {
+      "Sid": "Queues",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueUrl", "sqs:ReceiveMessage",
+        "sqs:DeleteMessage", "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": "arn:aws:sqs:us-east-1:${AWS_ACCOUNT_ID}:*-queue"
+    },
+    {
+      "Sid": "Metrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": { "StringEquals": { "cloudwatch:namespace": "ITpipes/Conversion" } }
+    }
+  ]
+}

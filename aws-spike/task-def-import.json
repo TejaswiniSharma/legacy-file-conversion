@@ -1,0 +1,39 @@
+{
+  "family": "itpipes-import-worker",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "networkMode": "awsvpc",
+  "cpu": "1024",
+  "memory": "4096",
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/itpipes-ecs-execution",
+  "taskRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/itpipes-worker-task",
+  "containerDefinitions": [
+    {
+      "name": "worker",
+      "image": "${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/itpipes-worker:${IMAGE_TAG}",
+      "essential": true,
+      "command": [
+        "node",
+        "--experimental-strip-types",
+        "src/poll-loop.ts",
+        "import"
+      ],
+      "environment": [
+        {
+          "name": "POLL_SECONDS",
+          "value": "0"
+        }
+      ],
+      "stopTimeout": 120,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/itpipes-worker",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "import"
+        }
+      }
+    }
+  ]
+}
