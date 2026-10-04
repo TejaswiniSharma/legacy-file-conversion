@@ -372,9 +372,8 @@ default; the demo number is the exception.
 
 ### Not built
 
-Nothing further. Earlier this section said the ECS **service** and **autoscaling** were missing. This was a single `run-task`, which exits after its poll window.
-A service would keep N tasks alive and is where the queue-depth scaling policy attaches. That is the last
-gap NOTES.md names and the natural next step.
+The export lane. Its queue, visibility timeout and `package.zip` configuration all exist, but no export
+worker was ever launched.
 
 ### Smaller notes
 
